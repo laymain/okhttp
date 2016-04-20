@@ -197,7 +197,7 @@ public class Platform {
    * Is Java 9.  Does not include Java 10 or later.
    */
   private static boolean isJava9() {
-    return System.getProperty("java.specification.version").equals("9");
+    return System.getProperty("java.specification.version", "").equals("9");
   }
 
   /** Android 2.3 or better. */
