@@ -17,23 +17,18 @@
 package okhttp3.internal;
 
 import android.util.Log;
+import okhttp3.Protocol;
+import okio.Buffer;
+
+import javax.net.ssl.*;
 import java.io.IOException;
-import java.lang.reflect.Field;
-import java.lang.reflect.InvocationHandler;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
+import java.lang.reflect.*;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.logging.Level;
-import javax.net.ssl.SSLParameters;
-import javax.net.ssl.SSLSocket;
-import javax.net.ssl.SSLSocketFactory;
-import javax.net.ssl.X509TrustManager;
-import okhttp3.Protocol;
-import okio.Buffer;
 
 import static okhttp3.internal.Internal.logger;
 
@@ -43,6 +38,8 @@ import static okhttp3.internal.Internal.logger;
  * <h3>Server name indication (SNI)</h3>
  *
  * <p>Supported on Android 2.3+.
+ *
+ * Supported on OpenJDK 8+
  *
  * <h3>Session Tickets</h3>
  *
@@ -177,8 +174,15 @@ public class Platform {
           SSLParameters.class.getMethod("setApplicationProtocols", String[].class);
       Method getProtocolMethod = SSLSocket.class.getMethod("getApplicationProtocol");
 
-      return new Jdk9Platform(setProtocolMethod, getProtocolMethod);
-    } catch (NoSuchMethodException e) {
+      Class<?> hostNameClass = Class.forName("javax.net.ssl.SNIHostName");
+      Constructor<?> hostNameCtor = hostNameClass.getConstructor(String.class);
+
+      Class<?> serverNameClass = Class.forName("javax.net.ssl.SNIServerName");
+      Method setServerNamesMethod =
+          SSLParameters.class.getMethod("setServerNames", serverNameClass);
+
+      return new Jdk9Platform(setProtocolMethod, getProtocolMethod, hostNameCtor, setServerNamesMethod);
+    } catch (ClassNotFoundException | NoSuchMethodException e) {
     }
 
     // Find Jetty's ALPN extension for OpenJDK.
@@ -191,8 +195,22 @@ public class Platform {
       Method putMethod = negoClass.getMethod("put", SSLSocket.class, providerClass);
       Method getMethod = negoClass.getMethod("get", SSLSocket.class);
       Method removeMethod = negoClass.getMethod("remove", SSLSocket.class);
+
+      Constructor<?> hostNameCtor = null;
+      Method setServerNamesMethod = null;
+      try {
+        Class<?> hostNameClass = Class.forName("javax.net.ssl.SNIHostName");
+        hostNameCtor = hostNameClass.getConstructor(String.class);
+
+        Class<?> serverNameClass = Class.forName("javax.net.ssl.SNIServerName");
+        setServerNamesMethod =
+            SSLParameters.class.getMethod("setServerNames", serverNameClass);
+      } catch (ClassNotFoundException | NoSuchMethodException e) {
+      }
+
       return new JdkWithJettyBootPlatform(
-          putMethod, getMethod, removeMethod, clientProviderClass, serverProviderClass);
+          putMethod, getMethod, removeMethod, clientProviderClass, serverProviderClass, hostNameCtor,
+          setServerNamesMethod);
     } catch (ClassNotFoundException | NoSuchMethodException ignored) {
     }
 
@@ -303,10 +321,15 @@ public class Platform {
   private static final class Jdk9Platform extends Platform {
     private Method setProtocolMethod = null;
     private Method getProtocolMethod = null;
+    private final Constructor<?> hostNameCtor;
+    private final Method setServerNamesMethod;
 
-    public Jdk9Platform(Method setProtocolMethod, Method getProtocolMethod) {
+    public Jdk9Platform(Method setProtocolMethod, Method getProtocolMethod, Constructor<?> hostNameCtor,
+                        Method setServerNamesMethod) {
       this.setProtocolMethod = setProtocolMethod;
       this.getProtocolMethod = getProtocolMethod;
+      this.hostNameCtor = hostNameCtor;
+      this.setServerNamesMethod = setServerNamesMethod;
     }
 
     @Override public void configureTlsExtensions(SSLSocket sslSocket, String hostname,
@@ -320,8 +343,13 @@ public class Platform {
           setProtocolMethod.invoke(sslParameters,
               new Object[]{names.toArray(new String[names.size()])});
 
+          if (hostname != null) {
+            Object sniHostName = hostNameCtor.newInstance(hostname);
+            setServerNamesMethod.invoke(sslParameters, Arrays.asList(sniHostName));
+          }
+
           sslSocket.setSSLParameters(sslParameters);
-        } catch (IllegalAccessException | InvocationTargetException e) {
+        } catch (IllegalAccessException | InvocationTargetException | InstantiationException e) {
           throw new AssertionError();
         }
       }
@@ -358,25 +386,40 @@ public class Platform {
     private final Method removeMethod;
     private final Class<?> clientProviderClass;
     private final Class<?> serverProviderClass;
+    private final Constructor<?> hostNameCtor;
+    private final Method setServerNamesMethod;
 
     public JdkWithJettyBootPlatform(Method putMethod, Method getMethod, Method removeMethod,
-        Class<?> clientProviderClass, Class<?> serverProviderClass) {
+                                    Class<?> clientProviderClass, Class<?> serverProviderClass,
+                                    Constructor<?> hostNameCtor, Method setServerNamesMethod) {
       this.putMethod = putMethod;
       this.getMethod = getMethod;
       this.removeMethod = removeMethod;
       this.clientProviderClass = clientProviderClass;
       this.serverProviderClass = serverProviderClass;
+      this.hostNameCtor = hostNameCtor;
+      this.setServerNamesMethod = setServerNamesMethod;
     }
 
     @Override public void configureTlsExtensions(
         SSLSocket sslSocket, String hostname, List<Protocol> protocols) {
-      List<String> names = alpnProtocolNames(protocols);
-
       try {
+        // This is linked to ALPN support instead of JDK 8 to keep the vanilla Platform simple
+        if (hostname != null && hostNameCtor != null && setServerNamesMethod != null) {
+          SSLParameters sslParameters = sslSocket.getSSLParameters();
+
+          Object sniHostName = hostNameCtor.newInstance(hostname);
+          setServerNamesMethod.invoke(sslParameters, Arrays.asList(sniHostName));
+
+          sslSocket.setSSLParameters(sslParameters);
+        }
+
+        List<String> names = alpnProtocolNames(protocols);
+
         Object provider = Proxy.newProxyInstance(Platform.class.getClassLoader(),
             new Class[] {clientProviderClass, serverProviderClass}, new JettyNegoProvider(names));
         putMethod.invoke(null, sslSocket, provider);
-      } catch (InvocationTargetException | IllegalAccessException e) {
+      } catch (InvocationTargetException | IllegalAccessException | InstantiationException e) {
         throw new AssertionError(e);
       }
     }
